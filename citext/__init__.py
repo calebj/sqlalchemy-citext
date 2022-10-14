@@ -2,11 +2,12 @@ from __future__ import unicode_literals
 
 import psycopg2.extensions
 import sqlalchemy
+import sqlalchemy.event as event
 import sqlalchemy.types as types
 from sqlalchemy.dialects.postgresql.base import ischema_names
 
 
-__version__ = '1.8.0'
+__version__ = '1.9.0'
 
 
 class CIText(types.Concatenable, types.UserDefinedType):
@@ -43,16 +44,55 @@ class CIText(types.Concatenable, types.UserDefinedType):
 ischema_names['citext'] = CIText
 
 
-def register_citext_array(engine):
-    """Call once with an engine for citext values to be returned as strings instead of characters"""
-    results = engine.execute(sqlalchemy.text("SELECT typarray FROM pg_type WHERE typname = 'citext'"))
-    oids = tuple(row[0] for row in results)
-    array_type = psycopg2.extensions.new_array_type(oids, 'citext[]', psycopg2.STRING)
-    psycopg2.extensions.register_type(array_type, None)
+def _dbapi2_get_array_oid(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT typarray FROM pg_type WHERE typname = 'citext'")
+        res = cur.fetchone()
+
+    if res:
+        return res[0]
+
+
+def register_citext_array(engine: sqlalchemy.engine.Engine):
+    driver = engine.url.get_driver_name()
+
+    if driver in ('psycopg2', 'psycopg2cffi'):
+        if driver == 'psycopg2':
+            import psycopg2
+        else:
+            import psycopg2cffi as psycopg2
+
+        def connect(dbapi_connection, connection_record):
+            res = _dbapi2_get_array_oid(dbapi_connection)
+
+            if res:
+                array_type = psycopg2.extensions.new_array_type((res,), 'citext[]', psycopg2.STRING)
+                psycopg2.extensions.register_type(array_type, dbapi_connection)
+    elif driver == 'psycopg':
+        import psycopg
+
+        def connect(dbapi_connection, connection_record):
+            res = psycopg.types.TypeInfo.fetch(dbapi_connection, 'citext')
+            if res:
+                res.register(dbapi_connection)
+    elif driver == 'pg8000':
+        from pg8000.converters import string_array_in
+
+        def connect(dbapi_connection, connection_record):
+            res = _dbapi2_get_array_oid(dbapi_connection)
+
+            if res:
+                dbapi_connection.register_in_adapter(res, string_array_in)
+    elif driver == 'asyncpg':
+        return  # asyncpg handles this already
+    else:
+        raise RuntimeError("Unknown driver: " + driver)
+
+    event.listens_for(engine, "connect")(connect)
 
 
 if __name__ == '__main__':
-    from sqlalchemy import create_engine, MetaData, Integer, __version__ as sa_version
+    from sqlalchemy import create_engine, MetaData, Integer, ARRAY, __version__ as sa_version
     from sqlalchemy.schema import Column
     import sqlalchemy.orm as orm
 
@@ -63,6 +103,7 @@ if __name__ == '__main__':
         from sqlalchemy.orm import declarative_base
 
     engine = create_engine('postgresql://localhost/test_db')
+    register_citext_array(engine)
     meta = MetaData()
     Base = declarative_base(metadata=meta)
     conn = engine.connect()
@@ -72,9 +113,10 @@ if __name__ == '__main__':
         __tablename__ = 'test'
         id = Column(Integer, primary_key=True)
         txt = Column(CIText)
+        txt_array = Column(ARRAY(CIText))
 
         def __repr__(self):
-            return "TestObj(%r, %r)" % (self.id, self.txt)
+            return "TestObj(%r, %r, %r)" % (self.id, self.txt, self.txt_array)
 
 
     with conn.begin():
@@ -84,10 +126,11 @@ if __name__ == '__main__':
     Session = orm.sessionmaker(bind=engine)
     ses = Session()
 
-    to = TestObj(id=1, txt='FooFighter')
+    to = TestObj(id=1, txt='FooFighter', txt_array=['foo', 'bar'])
     ses.add(to)
     ses.commit()
     row = ses.query(TestObj).filter(TestObj.txt == 'foofighter').all()
     assert len(row) == 1
+    assert row[0].txt_array == ['foo', 'bar']
     print(row)
     ses.close()
