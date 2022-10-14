@@ -52,36 +52,39 @@ def register_citext_array(engine):
 
 
 if __name__ == '__main__':
-    from sqlalchemy import create_engine, MetaData, Integer
-    from sqlalchemy.schema import Column, Table
+    from sqlalchemy import create_engine, MetaData, Integer, __version__ as sa_version
+    from sqlalchemy.schema import Column
     import sqlalchemy.orm as orm
+
+    # declarative_base was moved to orm in 1.4
+    if sa_version.split('.') < '1.4'.split('.'):
+        from sqlalchemy.ext.declarative import declarative_base
+    else:
+        from sqlalchemy.orm import declarative_base
 
     engine = create_engine('postgresql://localhost/test_db')
     meta = MetaData()
-
-    test_table = Table('test', meta,
-        Column('id', Integer(), primary_key=True),
-        Column('txt', CIText()))
-
+    Base = declarative_base(metadata=meta)
     conn = engine.connect()
 
-    meta.bind = conn
-    meta.drop_all()
-    meta.create_all()
 
-    class TestObj(object):
-        def __init__(self, id_, txt):
-            self.id = id_
-            self.txt = txt
+    class TestObj(Base):
+        __tablename__ = 'test'
+        id = Column(Integer, primary_key=True)
+        txt = Column(CIText)
 
         def __repr__(self):
             return "TestObj(%r, %r)" % (self.id, self.txt)
 
-    orm.mapper(TestObj, test_table)
+
+    with conn.begin():
+        meta.drop_all(bind=conn)
+        meta.create_all(bind=conn)
+
     Session = orm.sessionmaker(bind=engine)
     ses = Session()
 
-    to = TestObj(1, txt='FooFighter')
+    to = TestObj(id=1, txt='FooFighter')
     ses.add(to)
     ses.commit()
     row = ses.query(TestObj).filter(TestObj.txt == 'foofighter').all()
